@@ -13,8 +13,8 @@ WHAT YOU CONFIGURE
 2. Four secrets, set as environment variables (GitHub Secrets in the cloud):
       VA_USERNAME          your membership number (e.g. 110035581)
       VA_PASSWORD          your mylocker password
-      TELEGRAM_BOT_TOKEN   from BotFather (see README)
-      TELEGRAM_CHAT_ID     your chat id (see README)
+      TELEGRAM_BOT_TOKEN   from BotFather
+      TELEGRAM_CHAT_ID     your chat id (a number)
 
 HOW TO TEST (no need to wait for a real spot)
 ---------------------------------------------
@@ -50,13 +50,23 @@ WATCHLIST = [
         "label": "BODYPUMP, Mon 8:15pm, Grace L. (Paya Lebar)",
         "site": "SPL",
         "date": "2026-06-15",
-        "match": {"ClassName": "BODYPUMP", "TimeString": "8:15pm", "Instructor": "Grace"},
+        "match": {
+            "ClassName": "BODYPUMP",
+            "TimeString": "8:15pm",
+            "Instructor": "Grace",
+        },
     },
+    # TEMPORARY TEST ENTRY - a class that should currently have space.
+    # Once you have seen the Telegram alert fire, delete this whole block.
     {
-        "label": "TEST - any open class",
+        "label": "TEST, BODYPUMP, Mon 7:15am, Shirley T. (Paya Lebar)",
         "site": "SPL",
-        "date": "2026-06-14",
-        "match": {"ClassName": "Cycle", "TimeString": "10:45am"},
+        "date": "2026-06-15",
+        "match": {
+            "ClassName": "BODYPUMP",
+            "TimeString": "7:15am",
+            "Instructor": "Shirley",
+        },
     },
 ]
 
@@ -69,6 +79,8 @@ WATCHLIST = [
 
 POLL_INTERVAL_SECONDS = 60      # how often to check. 60 is gentle and plenty fast.
 RUN_DURATION_MINUTES = 14       # how long one run polls before exiting.
+REQUEST_TIMEOUT = 30            # seconds to wait for the server before giving up.
+LOGIN_MAX_ATTEMPTS = 3          # how many times to retry login on a network blip.
 
 # ============================================================
 # ENDPOINTS  (the login URL is the one piece to confirm, see README)
@@ -100,7 +112,7 @@ def send_telegram(text):
         r = requests.post(
             url,
             json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"},
-            timeout=20,
+            timeout=REQUEST_TIMEOUT,
         )
         r.raise_for_status()
     except requests.RequestException as e:
@@ -111,9 +123,8 @@ def login():
     """
     Log in and return a fresh Bearer token.
 
-    This uses the standard ASP.NET OAuth password flow, which the evidence
-    strongly points to. If the `token` request you capture shows a different
-    body, adjust the "data" dict below to match it.
+    Uses the ASP.NET OAuth password flow (confirmed against the token request).
+    Retries a few times so a single slow response does not kill the run.
     """
     if not VA_USERNAME or not VA_PASSWORD:
         raise SystemExit("Missing VA_USERNAME or VA_PASSWORD. Set them as secrets.")
@@ -123,18 +134,31 @@ def login():
         "username": VA_USERNAME,
         "password": VA_PASSWORD,
     }
-    r = requests.post(TOKEN_URL, data=data, timeout=20)
-    if r.status_code == 400:
-        raise SystemExit(
-            "Login was rejected (400). Double check your username and password, "
-            "and confirm the token request body matches (see README)."
-        )
-    r.raise_for_status()
-    token = r.json().get("access_token")
-    if not token:
-        raise SystemExit(f"Login succeeded but no access_token in response: {r.text[:200]}")
-    log("Logged in, got a fresh token.")
-    return token
+
+    last_error = None
+    for attempt in range(1, LOGIN_MAX_ATTEMPTS + 1):
+        try:
+            r = requests.post(TOKEN_URL, data=data, timeout=REQUEST_TIMEOUT)
+            if r.status_code == 400:
+                raise SystemExit(
+                    "Login was rejected (400). Double check your username and "
+                    "password secrets, and confirm the token request body matches."
+                )
+            r.raise_for_status()
+            token = r.json().get("access_token")
+            if not token:
+                raise SystemExit(
+                    f"Login succeeded but no access_token in response: {r.text[:200]}"
+                )
+            log("Logged in, got a fresh token.")
+            return token
+        except requests.RequestException as e:
+            last_error = e
+            log(f"Login attempt {attempt} of {LOGIN_MAX_ATTEMPTS} failed ({e}).")
+            if attempt < LOGIN_MAX_ATTEMPTS:
+                time.sleep(5)
+
+    raise SystemExit(f"Login failed after {LOGIN_MAX_ATTEMPTS} attempts: {last_error}")
 
 
 def query_classes(token, site, iso_date):
@@ -148,7 +172,7 @@ def query_classes(token, site, iso_date):
         "X-Mylocker-Language": "en-SG",
     }
     payload = {"Category": 0, "AMPM": "ALL", "ISODate": iso_date, "SiteID": site}
-    r = requests.post(API_URL, json=payload, headers=headers, timeout=20)
+    r = requests.post(API_URL, json=payload, headers=headers, timeout=REQUEST_TIMEOUT)
     if r.status_code == 401:
         raise PermissionError("token expired")
     r.raise_for_status()
