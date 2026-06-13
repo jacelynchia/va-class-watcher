@@ -1,0 +1,35 @@
+name: VA class watcher
+
+# Runs the watcher on a schedule so it works 24/7 without your laptop.
+# Each run polls for ~14 minutes, then this schedule starts the next one,
+# giving near-continuous coverage. You can also trigger a run by hand from
+# the Actions tab (the "Run workflow" button), which is great for testing.
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+    workflow_dispatch:
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out the repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run the watcher
+        env:
+          VA_USERNAME: ${{ secrets.VA_USERNAME }}
+          VA_PASSWORD: ${{ secrets.VA_PASSWORD }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python va_watcher.py
