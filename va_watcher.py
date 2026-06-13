@@ -7,6 +7,14 @@ the moment a spot opens up (SpacesRemaining goes above 0).
 Designed to run unattended on GitHub Actions, so it does NOT need your laptop.
 It logs in by itself each run, so there is no token to copy by hand.
 
+RECURRING CLASSES
+-----------------
+Each watchlist entry can use either:
+  "weekday": "Monday"     -> auto-rolls to the next Monday, every run. Best for
+                             a weekly recurring class. Set once, never touch it.
+  "date": "2026-06-15"    -> a single fixed date (YYYY-MM-DD), for a one-off.
+Weekdays are resolved in Singapore time, so "Monday" always means your Monday.
+
 WHAT YOU CONFIGURE
 ------------------
 1. The WATCHLIST below (which classes to watch). Add as many as you like.
@@ -18,60 +26,56 @@ WHAT YOU CONFIGURE
 
 HOW TO TEST (no need to wait for a real spot)
 ---------------------------------------------
-A. Telegram plumbing only:   python va_watcher.py --test-telegram
-   Sends a single test message. If it lands on your phone, Telegram is wired up.
-
-B. Full pipeline:  temporarily add a class that is OPEN right now to the
-   WATCHLIST (pick any class in the app that has space), then run the bot
-   (or click "Run workflow" in GitHub Actions). You should get an alert
-   within a minute. That proves login, query, matching, and Telegram all
-   work. Then remove the test class and keep your real one.
+Temporarily add a class that is OPEN right now to the WATCHLIST, run the bot
+(or click "Run workflow" in GitHub Actions), and you should get an alert within
+a minute. Then remove the test class and keep your real ones.
 """
 
 import os
 import sys
 import time
 import requests
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
+from zoneinfo import ZoneInfo
+
+# Singapore timezone, so weekday and date logic matches your local calendar.
+SGT = ZoneInfo("Asia/Singapore")
 
 # ============================================================
 # WATCHLIST - edit this to track any classes you want
 # ============================================================
-# Each entry watches one class on one date at one club.
 # "match" uses case-insensitive "contains", so "BODYPUMP" matches "BODYPUMP(tm)"
 # and "Grace" matches "Grace L.". Include just enough fields to be unambiguous.
 #
-# site:  the SiteID. "SPL" is Paya Lebar. (Capture other clubs the same way
-#        we found SPL, from the request Payload.)
-# date:  the ISODate string, format YYYY-MM-DD. Update weekly for recurring classes.
+# site:     the SiteID. "SPL" is Paya Lebar.
+# weekday:  "Monday".."Sunday" for a recurring class (auto-rolls each week), OR
+# date:     "YYYY-MM-DD" for a one-off. Use one or the other, not both.
 
 WATCHLIST = [
     {
         "label": "BODYPUMP, Mon 8:15pm, Grace L. (Paya Lebar)",
         "site": "SPL",
-        "date": "2026-06-15",
-        "match": {
-            "ClassName": "BODYPUMP",
-            "TimeString": "8:15pm",
-            "Instructor": "Grace",
-        },
+        "weekday": "Monday",
+        "match": {"ClassName": "BODYPUMP", "TimeString": "8:15pm", "Instructor": "Grace"},
+    },
+    {
+        "label": "BODYPUMP, Wed 8:00pm, Grace L. (Paya Lebar)",
+        "site": "SPL",
+        "weekday": "Wednesday",
+        "match": {"ClassName": "BODYPUMP", "TimeString": "8:00pm", "Instructor": "Grace"},
     },
 ]
 
 # ============================================================
 # RUN BEHAVIOUR
 # ============================================================
-# This script polls in a loop for RUN_DURATION_MINUTES, then exits. The GitHub
-# Actions schedule restarts it, giving near-continuous coverage with a fast
-# poll interval. Keep RUN_DURATION_MINUTES slightly below your cron interval.
-
 POLL_INTERVAL_SECONDS = 60      # how often to check. 60 is gentle and plenty fast.
 RUN_DURATION_MINUTES = 14       # how long one run polls before exiting.
 REQUEST_TIMEOUT = 30            # seconds to wait for the server before giving up.
 LOGIN_MAX_ATTEMPTS = 3          # how many times to retry login on a network blip.
 
 # ============================================================
-# ENDPOINTS  (the login URL is the one piece to confirm, see README)
+# ENDPOINTS
 # ============================================================
 TOKEN_URL = "https://hal.virginactive.com.sg/token"
 API_URL = "https://hal.virginactive.com.sg/api/classes/bookableclassquery"
@@ -84,10 +88,34 @@ VA_PASSWORD = os.environ.get("VA_PASSWORD")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
+WEEKDAYS = {
+    "monday": 0, "tuesday": 1, "wednesday": 2, "thursday": 3,
+    "friday": 4, "saturday": 5, "sunday": 6,
+}
+
 
 def log(msg):
-    stamp = datetime.now().strftime("%H:%M:%S")
+    stamp = datetime.now(SGT).strftime("%H:%M:%S")
     print(f"[{stamp}] {msg}", flush=True)
+
+
+def next_weekday_iso(weekday_name):
+    """Return the ISO date of the next given weekday (today counts), in SGT."""
+    key = weekday_name.strip().lower()
+    if key not in WEEKDAYS:
+        raise SystemExit(f"Unknown weekday '{weekday_name}'. Use Monday..Sunday.")
+    today = datetime.now(SGT).date()
+    days_ahead = (WEEKDAYS[key] - today.weekday()) % 7
+    return (today + timedelta(days=days_ahead)).isoformat()
+
+
+def resolve_date(entry):
+    """Work out the date this entry should query: weekday auto-roll or fixed date."""
+    if "weekday" in entry:
+        return next_weekday_iso(entry["weekday"])
+    if "date" in entry:
+        return entry["date"]
+    raise SystemExit(f"Entry '{entry.get('label')}' needs a 'weekday' or a 'date'.")
 
 
 def send_telegram(text):
@@ -176,35 +204,29 @@ def class_matches(cls, criteria):
     return True
 
 
-def run_test_telegram():
-    log("Sending a Telegram test message...")
-    send_telegram(
-        "Test from your Virgin Active watcher. "
-        "If you can read this, Telegram is wired up correctly."
-    )
-    log("Done. Check your phone.")
-
-
 def main():
     if "--test-telegram" in sys.argv:
-        run_test_telegram()
+        log("Sending a Telegram test message...")
+        send_telegram("Test from your Virgin Active watcher. Telegram is wired up.")
+        log("Done. Check your phone.")
         return
 
     if not WATCHLIST:
         raise SystemExit("WATCHLIST is empty. Add at least one class to watch.")
 
-    # Group entries by (site, date) so we make one API call per unique combo.
+    # Resolve each entry's date now (weekday auto-roll), then group by (site, date)
+    # so we make one API call per unique club and date.
     groups = {}
     for entry in WATCHLIST:
-        key = (entry["site"], entry["date"])
-        groups.setdefault(key, []).append(entry)
+        iso_date = resolve_date(entry)
+        log(f"Watching '{entry['label']}' on {iso_date}.")
+        groups.setdefault((entry["site"], iso_date), []).append(entry)
 
     token = login()
     alerted = set()  # labels already alerted this run, to avoid repeat pings
     stop_at = datetime.now() + timedelta(minutes=RUN_DURATION_MINUTES)
 
-    log(f"Watching {len(WATCHLIST)} class(es). This run lasts "
-        f"{RUN_DURATION_MINUTES} min, checking every {POLL_INTERVAL_SECONDS}s.")
+    log(f"This run lasts {RUN_DURATION_MINUTES} min, checking every {POLL_INTERVAL_SECONDS}s.")
 
     while datetime.now() < stop_at:
         for (site, iso_date), entries in groups.items():
@@ -223,7 +245,7 @@ def main():
                 hit = next((c for c in classes if class_matches(c, entry["match"])), None)
 
                 if hit is None:
-                    log(f"'{label}': not found in results (check date/match fields).")
+                    log(f"'{label}': not found in results (check match fields).")
                     continue
 
                 spaces = hit.get("SpacesRemaining", 0)
