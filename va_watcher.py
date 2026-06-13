@@ -56,18 +56,6 @@ WATCHLIST = [
             "Instructor": "Grace",
         },
     },
-    # TEMPORARY TEST ENTRY - a class that should currently have space.
-    # Once you have seen the Telegram alert fire, delete this whole block.
-    {
-        "label": "TEST, BODYPUMP, Mon 7:15am, Shirley T. (Paya Lebar)",
-        "site": "SPL",
-        "date": "2026-06-15",
-        "match": {
-            "ClassName": "BODYPUMP",
-            "TimeString": "7:15am",
-            "Instructor": "Shirley",
-        },
-    },
 ]
 
 # ============================================================
