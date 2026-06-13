@@ -50,19 +50,14 @@ WATCHLIST = [
         "label": "BODYPUMP, Mon 8:15pm, Grace L. (Paya Lebar)",
         "site": "SPL",
         "date": "2026-06-15",
-        "match": {
-            "ClassName": "BODYPUMP",
-            "TimeString": "8:15pm",
-            "Instructor": "Grace",
-        },
+        "match": {"ClassName": "BODYPUMP", "TimeString": "8:15pm", "Instructor": "Grace"},
     },
-    # Example of a second class you could watch at the same time:
-    # {
-    #     "label": "Reformer Athletic, Sun 10:15am (Paya Lebar)",
-    #     "site": "SPL",
-    #     "date": "2026-06-14",
-    #     "match": {"ClassName": "Reformer Pilates - Athletic", "TimeString": "10:15am"},
-    # },
+    {
+        "label": "TEST - any open class",
+        "site": "SPL",
+        "date": "2026-06-14",
+        "match": {"ClassName": "Cycle", "TimeString": "10:45am"},
+    },
 ]
 
 # ============================================================
