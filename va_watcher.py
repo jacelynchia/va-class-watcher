@@ -1,67 +1,47 @@
 """
-Virgin Active class watcher (cloud edition)
-===========================================
-Watches one or more Virgin Active classes and sends you a Telegram message
-the moment a spot opens up (SpacesRemaining goes above 0). Classes you are
-already booked into are skipped automatically, so you only hear about ones
-you still need.
+Virgin Active class watcher (cloud edition, interactive)
+========================================================
+Watches Virgin Active classes and sends a Telegram message the moment a spot
+opens up. Classes you are already booked into are skipped automatically.
 
-Designed to run unattended on GitHub Actions, so it does NOT need your laptop.
-It logs in by itself each run, so there is no token to copy by hand.
+You can control it by texting the bot on Telegram:
+  /watch class=BODYPUMP day=Friday time=7:00pm instructor=Grace [site=SPL]
+  /unwatch 2          (remove item 2 from the list)
+  /list               (show what is being watched)
+  /status             (is it running, what is watched)
+  /help               (show command help)
 
-RECURRING CLASSES
------------------
-Each watchlist entry can use either:
-  "weekday": "Monday"     -> auto-rolls to the next Monday, every run. Best for
-                             a weekly recurring class. Set once, never touch it.
-  "date": "2026-06-15"    -> a single fixed date (YYYY-MM-DD), for a one-off.
-Weekdays are resolved in Singapore time, so "Monday" always means your Monday.
+Runs on GitHub Actions. While a run is active it replies to commands within a
+second or two (Telegram long-polling). Between runs there can be a short delay.
 
-WHAT YOU CONFIGURE
-------------------
-1. The WATCHLIST below (which classes to watch). Add as many as you like.
-2. Four secrets, set as environment variables (GitHub Secrets in the cloud):
-      VA_USERNAME          your membership number (e.g. 110035581)
-      VA_PASSWORD          your mylocker password
-      TELEGRAM_BOT_TOKEN   from BotFather
-      TELEGRAM_CHAT_ID     your chat id (a number)
-
-HOW TO TEST (no need to wait for a real spot)
----------------------------------------------
-Temporarily add a class that is OPEN right now to the WATCHLIST, run the bot
-(or click "Run workflow" in GitHub Actions), and you should get an alert within
-a minute. Then remove the test class and keep your real ones.
+Persistence: the live watchlist is stored in state.json in this repo, updated
+by the bot. This needs the repo's Actions workflow permission set to read/write
+(Settings > Actions > General > Workflow permissions).
 """
 
 import os
 import sys
+import json
 import time
+import base64
 import requests
 from datetime import datetime, timedelta, date
 from zoneinfo import ZoneInfo
 
-# Singapore timezone, so weekday and date logic matches your local calendar.
 SGT = ZoneInfo("Asia/Singapore")
 
 # ============================================================
-# WATCHLIST - edit this to track any classes you want
+# DEFAULT WATCHLIST (used to seed state.json on the very first run)
 # ============================================================
-# "match" uses case-insensitive "contains", so "BODYPUMP" matches "BODYPUMP(tm)"
-# and "Grace" matches "Grace L.". Include just enough fields to be unambiguous.
-#
-# site:     the SiteID. "SPL" is Paya Lebar.
-# weekday:  "Monday".."Sunday" for a recurring class (auto-rolls each week), OR
-# date:     "YYYY-MM-DD" for a one-off. Use one or the other, not both.
-
-WATCHLIST = [
+# After the first run, the live list lives in state.json and is edited via
+# Telegram commands. Editing here only matters before state.json exists.
+DEFAULT_WATCHLIST = [
     {
-        "label": "BODYPUMP, Mon 8:15pm, Grace L. (Paya Lebar)",
         "site": "SPL",
         "weekday": "Monday",
         "match": {"ClassName": "BODYPUMP", "TimeString": "8:15pm", "Instructor": "Grace"},
     },
     {
-        "label": "BODYPUMP, Wed 8:00pm, Grace L. (Paya Lebar)",
         "site": "SPL",
         "weekday": "Wednesday",
         "match": {"ClassName": "BODYPUMP", "TimeString": "8:00pm", "Instructor": "Grace"},
@@ -71,10 +51,49 @@ WATCHLIST = [
 # ============================================================
 # RUN BEHAVIOUR
 # ============================================================
-POLL_INTERVAL_SECONDS = 60      # how often to check. 60 is gentle and plenty fast.
-RUN_DURATION_MINUTES = 330     # ~5.5 hours of continuous polling per run.
-REQUEST_TIMEOUT = 30            # seconds to wait for the server before giving up.
-LOGIN_MAX_ATTEMPTS = 3          # how many times to retry login on a network blip.
+POLL_INTERVAL_SECONDS = 60      # how often to check availability.
+RUN_DURATION_MINUTES = 230      # ~3h50m of polling per run (see workflow schedule).
+REQUEST_TIMEOUT = 30            # seconds for normal HTTP calls.
+LOGIN_MAX_ATTEMPTS = 3          # login retries on a network blip.
+DEFAULT_SITE = "SPL"            # used when a /watch command omits site.
+
+# All Virgin Active Singapore clubs, by SiteID, with friendly names and aliases.
+# Captured from the getoptions response. Add new clubs here if they open.
+CLUBS = {
+    "SRP": {"name": "Raffles Place", "aliases": ["raffles place", "raffles", "rp"]},
+    "STP": {"name": "Tanjong Pagar", "aliases": ["tanjong pagar", "tanjong", "tp"]},
+    "SHV": {"name": "Holland Village", "aliases": ["holland village", "holland", "hv"]},
+    "SMO": {"name": "Marina One", "aliases": ["marina one", "marina", "mo"]},
+    "SPL": {"name": "Paya Lebar", "aliases": ["paya lebar", "paya", "pl"]},
+}
+
+
+def resolve_site(value):
+    """
+    Turn a club name, alias, or code into a SiteID. Returns the SiteID string,
+    or None if it cannot be matched. Case-insensitive and quote-tolerant.
+    """
+    if not value:
+        return DEFAULT_SITE
+    v = value.strip().strip('"').strip("'").lower()
+    # direct code match (spl, smo, ...)
+    for code in CLUBS:
+        if v == code.lower():
+            return code
+    # name / alias match
+    for code, info in CLUBS.items():
+        if v == info["name"].lower() or v in info["aliases"]:
+            return code
+    # loose contains match (e.g. "marina one studio")
+    for code, info in CLUBS.items():
+        if info["name"].lower() in v or any(a in v for a in info["aliases"]):
+            return code
+    return None
+
+
+def club_name(site):
+    info = CLUBS.get(site)
+    return info["name"] if info else site
 
 # ============================================================
 # ENDPOINTS
@@ -84,17 +103,23 @@ API_URL = "https://hal.virginactive.com.sg/api/classes/bookableclassquery"
 BOOKINGS_URL = "https://hal.virginactive.com.sg/api/bookings/getbookings"
 
 # ============================================================
-# Secrets, read from the environment
+# Secrets / environment
 # ============================================================
 VA_USERNAME = os.environ.get("VA_USERNAME")
 VA_PASSWORD = os.environ.get("VA_PASSWORD")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
+GH_TOKEN = os.environ.get("GH_TOKEN")              # auto GITHUB_TOKEN, passed in workflow
+GH_REPO = os.environ.get("GITHUB_REPOSITORY")      # auto-set by Actions, e.g. owner/repo
+STATE_PATH = "state.json"
 
 WEEKDAYS = {
     "monday": 0, "tuesday": 1, "wednesday": 2, "thursday": 3,
     "friday": 4, "saturday": 5, "sunday": 6,
 }
+
+RUN_STOP_AT = None    # set in main(), used by /status
+STATE_SHA = None      # GitHub file sha for state.json, used to update it
 
 
 def log(msg):
@@ -102,27 +127,41 @@ def log(msg):
     print(f"[{stamp}] {msg}", flush=True)
 
 
+# ------------------------------------------------------------
+# Dates
+# ------------------------------------------------------------
 def next_weekday_iso(weekday_name):
-    """Return the ISO date of the next given weekday (today counts), in SGT."""
     key = weekday_name.strip().lower()
     if key not in WEEKDAYS:
-        raise SystemExit(f"Unknown weekday '{weekday_name}'. Use Monday..Sunday.")
+        raise ValueError(f"Unknown weekday '{weekday_name}'.")
     today = datetime.now(SGT).date()
     days_ahead = (WEEKDAYS[key] - today.weekday()) % 7
     return (today + timedelta(days=days_ahead)).isoformat()
 
 
 def resolve_date(entry):
-    """Work out the date this entry should query: weekday auto-roll or fixed date."""
     if "weekday" in entry:
         return next_weekday_iso(entry["weekday"])
     if "date" in entry:
         return entry["date"]
-    raise SystemExit(f"Entry '{entry.get('label')}' needs a 'weekday' or a 'date'.")
+    raise ValueError("Entry needs a 'weekday' or a 'date'.")
 
 
+def entry_label(entry):
+    m = entry.get("match", {})
+    when = entry.get("weekday") or entry.get("date", "")
+    s = f"{m.get('ClassName', 'class')}, {when} {m.get('TimeString', '')}".strip()
+    if m.get("Instructor"):
+        s += f", {m['Instructor']}"
+    if entry.get("site"):
+        s += f" ({club_name(entry['site'])})"
+    return s
+
+
+# ------------------------------------------------------------
+# Telegram
+# ------------------------------------------------------------
 def send_telegram(text):
-    """Send a message to your phone via the Telegram bot."""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         log("Telegram not configured (missing bot token or chat id).")
         return
@@ -138,37 +177,104 @@ def send_telegram(text):
         log(f"Failed to send Telegram message: {e}")
 
 
-def login():
-    """
-    Log in and return a fresh Bearer token.
+def tg_get_updates(offset):
+    """Long-poll for new messages. Returns up to ~50s blocking, or sooner."""
+    if not TELEGRAM_BOT_TOKEN:
+        return []
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
+    r = requests.get(url, params={"offset": offset, "timeout": 50}, timeout=70)
+    r.raise_for_status()
+    return r.json().get("result", [])
 
-    Uses the ASP.NET OAuth password flow (confirmed against the token request).
-    Retries a few times so a single slow response does not kill the run.
-    """
+
+# ------------------------------------------------------------
+# State persistence (state.json committed to the repo via the GitHub API)
+# ------------------------------------------------------------
+def _gh_headers():
+    return {"Authorization": f"Bearer {GH_TOKEN}", "Accept": "application/vnd.github+json"}
+
+
+def gh_read_state():
+    """Return (state_dict, sha) or (None, None) if missing/unavailable."""
+    if not GH_TOKEN or not GH_REPO:
+        return None, None
+    url = f"https://api.github.com/repos/{GH_REPO}/contents/{STATE_PATH}"
+    r = requests.get(url, headers=_gh_headers(), params={"ref": "main"}, timeout=REQUEST_TIMEOUT)
+    if r.status_code == 404:
+        return None, None
+    r.raise_for_status()
+    j = r.json()
+    content = base64.b64decode(j["content"]).decode("utf-8")
+    return json.loads(content), j["sha"]
+
+
+def gh_write_state(payload, sha):
+    url = f"https://api.github.com/repos/{GH_REPO}/contents/{STATE_PATH}"
+    body = {
+        "message": "update watcher state",
+        "content": base64.b64encode(json.dumps(payload, indent=2).encode()).decode(),
+        "branch": "main",
+    }
+    if sha:
+        body["sha"] = sha
+    r = requests.put(url, headers=_gh_headers(), json=body, timeout=REQUEST_TIMEOUT)
+    r.raise_for_status()
+    return r.json()["content"]["sha"]
+
+
+def load_state():
+    global STATE_SHA
+    data, sha = None, None
+    try:
+        data, sha = gh_read_state()
+    except Exception as e:
+        log(f"Could not read saved state ({e}). Falling back to defaults.")
+    STATE_SHA = sha
+    if not data:
+        data = {"watchlist": list(DEFAULT_WATCHLIST), "tg_offset": 0}
+    data.setdefault("watchlist", [])
+    data.setdefault("tg_offset", 0)
+    return data
+
+
+def save_state(state):
+    global STATE_SHA
+    if not GH_TOKEN or not GH_REPO:
+        return  # cannot persist; changes live only for this run
+    payload = {"watchlist": state["watchlist"], "tg_offset": state["tg_offset"]}
+    try:
+        STATE_SHA = gh_write_state(payload, STATE_SHA)
+    except requests.HTTPError as e:
+        status = getattr(e.response, "status_code", None)
+        if status in (409, 422):
+            try:
+                _, STATE_SHA = gh_read_state()
+                STATE_SHA = gh_write_state(payload, STATE_SHA)
+            except Exception as e2:
+                log(f"Could not save state after conflict ({e2}).")
+        else:
+            log(f"Could not save state ({e}).")
+    except Exception as e:
+        log(f"Could not save state ({e}).")
+
+
+# ------------------------------------------------------------
+# Virgin Active API
+# ------------------------------------------------------------
+def login():
     if not VA_USERNAME or not VA_PASSWORD:
         raise SystemExit("Missing VA_USERNAME or VA_PASSWORD. Set them as secrets.")
-
-    data = {
-        "grant_type": "password",
-        "username": VA_USERNAME,
-        "password": VA_PASSWORD,
-    }
-
+    data = {"grant_type": "password", "username": VA_USERNAME, "password": VA_PASSWORD}
     last_error = None
     for attempt in range(1, LOGIN_MAX_ATTEMPTS + 1):
         try:
             r = requests.post(TOKEN_URL, data=data, timeout=REQUEST_TIMEOUT)
             if r.status_code == 400:
-                raise SystemExit(
-                    "Login was rejected (400). Double check your username and "
-                    "password secrets, and confirm the token request body matches."
-                )
+                raise SystemExit("Login rejected (400). Check VA_USERNAME / VA_PASSWORD.")
             r.raise_for_status()
             token = r.json().get("access_token")
             if not token:
-                raise SystemExit(
-                    f"Login succeeded but no access_token in response: {r.text[:200]}"
-                )
+                raise SystemExit(f"Login gave no access_token: {r.text[:200]}")
             log("Logged in, got a fresh token.")
             return token
         except requests.RequestException as e:
@@ -176,49 +282,37 @@ def login():
             log(f"Login attempt {attempt} of {LOGIN_MAX_ATTEMPTS} failed ({e}).")
             if attempt < LOGIN_MAX_ATTEMPTS:
                 time.sleep(5)
-
     raise SystemExit(f"Login failed after {LOGIN_MAX_ATTEMPTS} attempts: {last_error}")
 
 
-def get_my_booked_ids(token):
-    """
-    Return a set of BookingIDs the member is already booked into.
-
-    Used to skip alerting for classes you have already secured. Returns an
-    empty set on any error, so a hiccup here never blocks the normal watching.
-    """
-    headers = {
+def _va_headers(token):
+    return {
         "Authorization": f"Bearer {token}",
         "Accept": "application/json, text/plain, */*",
         "Origin": "https://mylocker.virginactive.com.sg",
         "Referer": "https://mylocker.virginactive.com.sg/",
         "X-Mylocker-Language": "en-SG",
     }
+
+
+def get_my_booked_ids(token):
     try:
-        r = requests.get(BOOKINGS_URL, headers=headers, timeout=REQUEST_TIMEOUT)
+        r = requests.get(BOOKINGS_URL, headers=_va_headers(token), timeout=REQUEST_TIMEOUT)
         if r.status_code == 401:
             raise PermissionError("token expired")
         r.raise_for_status()
-        data = r.json()
-        bookings = data.get("MyBookings", {}).get("Bookings", []) or []
+        bookings = (r.json().get("MyBookings", {}) or {}).get("Bookings", []) or []
         return {b.get("BookingID") for b in bookings if b.get("BookingID") is not None}
     except PermissionError:
         raise
     except requests.RequestException as e:
-        log(f"Could not fetch your bookings ({e}). Will not skip any this cycle.")
+        log(f"Could not fetch bookings ({e}). Not skipping any this cycle.")
         return set()
 
 
 def query_classes(token, site, iso_date):
-    """Fetch the class list for one club and one date."""
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json;charset=UTF-8",
-        "Accept": "application/json, text/plain, */*",
-        "Origin": "https://mylocker.virginactive.com.sg",
-        "Referer": "https://mylocker.virginactive.com.sg/",
-        "X-Mylocker-Language": "en-SG",
-    }
+    headers = dict(_va_headers(token))
+    headers["Content-Type"] = "application/json;charset=UTF-8"
     payload = {"Category": 0, "AMPM": "ALL", "ISODate": iso_date, "SiteID": site}
     r = requests.post(API_URL, json=payload, headers=headers, timeout=REQUEST_TIMEOUT)
     if r.status_code == 401:
@@ -228,89 +322,263 @@ def query_classes(token, site, iso_date):
 
 
 def class_matches(cls, criteria):
-    """True if every criterion is a case-insensitive substring of the class field."""
     for field, wanted in criteria.items():
-        actual = str(cls.get(field, "")).lower()
-        if wanted.lower() not in actual:
+        if wanted.lower() not in str(cls.get(field, "")).lower():
             return False
     return True
 
 
+# ------------------------------------------------------------
+# Availability check
+# ------------------------------------------------------------
+def check_availability(token, entries, alerted):
+    if not entries:
+        return
+    groups = {}
+    for e in entries:
+        try:
+            d = resolve_date(e)
+        except ValueError as ex:
+            log(f"Bad entry skipped ({ex}).")
+            continue
+        groups.setdefault((e["site"], d), []).append(e)
+
+    booked_ids = get_my_booked_ids(token)  # may raise PermissionError
+
+    for (site, iso_date), es in groups.items():
+        try:
+            classes = query_classes(token, site, iso_date)
+        except requests.RequestException as ex:
+            log(f"Network issue on {site} {iso_date}: {ex}. Skipping this cycle.")
+            continue
+        for e in es:
+            label = entry_label(e)
+            hit = next((c for c in classes if class_matches(c, e["match"])), None)
+            if hit is None:
+                log(f"'{label}': not found in results.")
+                continue
+            if hit.get("BookingID") in booked_ids:
+                log(f"'{label}': already booked, skipping.")
+                continue
+            spaces = hit.get("SpacesRemaining", 0)
+            if spaces > 0:
+                if label not in alerted:
+                    log(f"'{label}': SPOT OPEN ({spaces} left). Alerting!")
+                    send_telegram(
+                        f"<b>Spot available!</b>\n{label}\n"
+                        f"{spaces} space(s) just opened.\n"
+                        f"Book now: https://mylocker.virginactive.com.sg/#/bookaclass"
+                    )
+                    alerted.add(label)
+                else:
+                    log(f"'{label}': still open, already alerted this run.")
+            else:
+                log(f"'{label}': full.")
+
+
+# ------------------------------------------------------------
+# Telegram commands
+# ------------------------------------------------------------
+HELP_TEXT = (
+    "<b>Virgin Active watcher commands</b>\n"
+    "/watch class=BODYPUMP day=Friday time=7:00pm instructor=Grace club=\"Marina One\"\n"
+    "   (club is optional, defaults to Paya Lebar; instructor is optional)\n"
+    "/unwatch N    remove item N from the list\n"
+    "/list    show what is being watched\n"
+    "/clubs    list the clubs you can watch\n"
+    "/status    is it running, what is watched\n"
+    "/help    this message\n\n"
+    "Tip: use single words for values, e.g. class=BODYPUMP, instructor=Grace, "
+    "and the exact time shown in the app, e.g. time=7:00pm."
+)
+
+
+def parse_kv(args_text):
+    out = {}
+    for tok in args_text.split():
+        if "=" in tok:
+            k, v = tok.split("=", 1)
+            out[k.strip().lower()] = v.strip()
+    return out
+
+
+def cmd_list(state):
+    entries = state["watchlist"]
+    if not entries:
+        send_telegram("Not watching anything right now. Add one with /watch.")
+        return
+    lines = ["<b>Currently watching:</b>"]
+    for i, e in enumerate(entries, 1):
+        try:
+            when = resolve_date(e)
+        except ValueError:
+            when = "?"
+        lines.append(f"{i}. {entry_label(e)}  (next: {when})")
+    send_telegram("\n".join(lines))
+
+
+def cmd_status(state):
+    n = len(state["watchlist"])
+    if RUN_STOP_AT:
+        ends = RUN_STOP_AT.astimezone(SGT).strftime("%H:%M")
+        running = f"Active this run until about {ends} SGT, then the next run takes over."
+    else:
+        running = "Running."
+    send_telegram(f"<b>Status</b>\n{running}\nWatching {n} class(es). Use /list to see them.")
+
+
+def cmd_watch(args_text, state):
+    kv = parse_kv(args_text)
+    classname = kv.get("class") or kv.get("name")
+    day = kv.get("day") or kv.get("weekday")
+    one_date = kv.get("date")
+    t = kv.get("time")
+    instr = kv.get("instructor") or kv.get("coach")
+    site_input = kv.get("club") or kv.get("site")
+    site = resolve_site(site_input)
+    if site is None:
+        names = ", ".join(info["name"] for info in CLUBS.values())
+        send_telegram(f"I don't recognise that club. Options: {names}.")
+        return
+
+    if not classname or not t or not (day or one_date):
+        send_telegram(
+            "I need at least class, time, and a day. Example:\n"
+            "/watch class=BODYPUMP day=Friday time=7:00pm instructor=Grace"
+        )
+        return
+
+    match = {"ClassName": classname, "TimeString": t.lower().replace(" ", "")}
+    if instr:
+        match["Instructor"] = instr
+    entry = {"site": site, "match": match}
+    if day:
+        if day.strip().lower() not in WEEKDAYS:
+            send_telegram(f"'{day}' is not a weekday. Use Monday..Sunday.")
+            return
+        entry["weekday"] = day.strip().capitalize()
+    else:
+        entry["date"] = one_date
+
+    # Avoid duplicates (so reprocessing a command is harmless).
+    for e in state["watchlist"]:
+        if e.get("site") == entry["site"] and e.get("match") == entry["match"] and \
+           e.get("weekday") == entry.get("weekday") and e.get("date") == entry.get("date"):
+            send_telegram(f"Already watching: {entry_label(entry)}")
+            return
+
+    state["watchlist"].append(entry)
+    send_telegram(f"Now watching: {entry_label(entry)}")
+
+
+def cmd_unwatch(args_text, state):
+    entries = state["watchlist"]
+    arg = args_text.strip()
+    if not arg.isdigit():
+        send_telegram("Tell me which number to remove, e.g. /unwatch 2. Use /list to see numbers.")
+        return
+    idx = int(arg)
+    if idx < 1 or idx > len(entries):
+        send_telegram(f"There is no item {idx}. Use /list to see the current numbers.")
+        return
+    removed = entries.pop(idx - 1)
+    send_telegram(f"Stopped watching: {entry_label(removed)}")
+
+
+def cmd_clubs():
+    lines = ["<b>Clubs you can watch:</b>"]
+    for info in CLUBS.values():
+        lines.append(f"- {info['name']}")
+    lines.append("\nUse the name in /watch, e.g. club=\"Marina One\" (or just club=marina).")
+    send_telegram("\n".join(lines))
+
+
+def handle_command(text, state):
+    parts = text.strip().split(maxsplit=1)
+    cmd = parts[0].lower().lstrip("/")
+    args = parts[1] if len(parts) > 1 else ""
+    # allow "/watch@botname" style
+    cmd = cmd.split("@", 1)[0]
+
+    if cmd in ("start", "help"):
+        send_telegram(HELP_TEXT)
+    elif cmd == "list":
+        cmd_list(state)
+    elif cmd == "status":
+        cmd_status(state)
+    elif cmd == "watch":
+        cmd_watch(args, state)
+    elif cmd == "unwatch":
+        cmd_unwatch(args, state)
+    elif cmd == "clubs":
+        cmd_clubs()
+    else:
+        send_telegram("Unknown command. Send /help to see what I can do.")
+
+
+# ------------------------------------------------------------
+# Main
+# ------------------------------------------------------------
 def main():
+    global RUN_STOP_AT
+
     if "--test-telegram" in sys.argv:
         log("Sending a Telegram test message...")
         send_telegram("Test from your Virgin Active watcher. Telegram is wired up.")
         log("Done. Check your phone.")
         return
 
-    if not WATCHLIST:
-        raise SystemExit("WATCHLIST is empty. Add at least one class to watch.")
-
-    # Resolve each entry's date now (weekday auto-roll), then group by (site, date)
-    # so we make one API call per unique club and date.
-    groups = {}
-    for entry in WATCHLIST:
-        iso_date = resolve_date(entry)
-        log(f"Watching '{entry['label']}' on {iso_date}.")
-        groups.setdefault((entry["site"], iso_date), []).append(entry)
-
+    state = load_state()
     token = login()
-    alerted = set()  # labels already alerted this run, to avoid repeat pings
-    stop_at = datetime.now() + timedelta(minutes=RUN_DURATION_MINUTES)
+    alerted = set()
+    last_avail = 0.0
+    RUN_STOP_AT = datetime.now() + timedelta(minutes=RUN_DURATION_MINUTES)
 
-    log(f"This run lasts {RUN_DURATION_MINUTES} min, checking every {POLL_INTERVAL_SECONDS}s.")
-
-    while datetime.now() < stop_at:
-        # Feature 1: fetch the classes you are already booked into, so we can
-        # skip alerting for those. Refreshed every cycle so it stays current
-        # (e.g. if you book one mid-run, it goes quiet on the next pass).
+    log(f"Loaded {len(state['watchlist'])} watched class(es). "
+        f"Run lasts {RUN_DURATION_MINUTES} min.")
+    for e in state["watchlist"]:
         try:
-            booked_ids = get_my_booked_ids(token)
-        except PermissionError:
-            log("Token expired, logging in again...")
-            token = login()
-            booked_ids = get_my_booked_ids(token)
+            log(f"  - {entry_label(e)} (next: {resolve_date(e)})")
+        except ValueError:
+            log(f"  - {entry_label(e)} (bad date)")
 
-        for (site, iso_date), entries in groups.items():
+    while datetime.now() < RUN_STOP_AT:
+        # 1. Commands (long-poll, so this also paces the loop)
+        try:
+            updates = tg_get_updates(state["tg_offset"])
+            changed = False
+            for u in updates:
+                state["tg_offset"] = u["update_id"] + 1
+                changed = True
+                msg = u.get("message") or u.get("edited_message") or {}
+                chat_id = str((msg.get("chat") or {}).get("id", ""))
+                if chat_id != str(TELEGRAM_CHAT_ID):
+                    continue  # ignore anyone who is not you
+                text = (msg.get("text") or "").strip()
+                if text.startswith("/"):
+                    try:
+                        handle_command(text, state)
+                    except Exception as ce:
+                        log(f"Command error: {ce}")
+                        send_telegram("Sorry, that command hit an error. Try /help.")
+            if changed:
+                save_state(state)
+        except requests.RequestException as e:
+            log(f"Telegram poll issue: {e}")
+            time.sleep(5)
+
+        # 2. Availability check, at most every POLL_INTERVAL_SECONDS
+        if time.time() - last_avail >= POLL_INTERVAL_SECONDS:
+            last_avail = time.time()
             try:
-                classes = query_classes(token, site, iso_date)
+                check_availability(token, state["watchlist"], alerted)
             except PermissionError:
                 log("Token expired, logging in again...")
                 token = login()
-                classes = query_classes(token, site, iso_date)
-            except requests.RequestException as e:
-                log(f"Network issue on {site} {iso_date}: {e}. Retrying next cycle.")
-                continue
 
-            for entry in entries:
-                label = entry["label"]
-                hit = next((c for c in classes if class_matches(c, entry["match"])), None)
-
-                if hit is None:
-                    log(f"'{label}': not found in results (check match fields).")
-                    continue
-
-                # Feature 1: already booked? Stay quiet.
-                if hit.get("BookingID") in booked_ids:
-                    log(f"'{label}': already booked, skipping.")
-                    continue
-
-                spaces = hit.get("SpacesRemaining", 0)
-                if spaces > 0:
-                    if label not in alerted:
-                        log(f"'{label}': SPOT OPEN ({spaces} left). Alerting!")
-                        send_telegram(
-                            f"<b>Spot available!</b>\n{label}\n"
-                            f"{spaces} space(s) just opened.\n"
-                            f"Book now: https://mylocker.virginactive.com.sg/#/bookaclass"
-                        )
-                        alerted.add(label)
-                    else:
-                        log(f"'{label}': still open, already alerted this run.")
-                else:
-                    log(f"'{label}': full.")
-
-        time.sleep(POLL_INTERVAL_SECONDS)
+        # If Telegram is not configured there is no long-poll to pace us.
+        if not TELEGRAM_BOT_TOKEN:
+            time.sleep(POLL_INTERVAL_SECONDS)
 
     log("Run finished. The schedule will start the next one shortly.")
 
