@@ -2,7 +2,9 @@
 Virgin Active class watcher (cloud edition)
 ===========================================
 Watches one or more Virgin Active classes and sends you a Telegram message
-the moment a spot opens up (SpacesRemaining goes above 0).
+the moment a spot opens up (SpacesRemaining goes above 0). Classes you are
+already booked into are skipped automatically, so you only hear about ones
+you still need.
 
 Designed to run unattended on GitHub Actions, so it does NOT need your laptop.
 It logs in by itself each run, so there is no token to copy by hand.
@@ -79,6 +81,7 @@ LOGIN_MAX_ATTEMPTS = 3          # how many times to retry login on a network bli
 # ============================================================
 TOKEN_URL = "https://hal.virginactive.com.sg/token"
 API_URL = "https://hal.virginactive.com.sg/api/classes/bookableclassquery"
+BOOKINGS_URL = "https://hal.virginactive.com.sg/api/bookings/getbookings"
 
 # ============================================================
 # Secrets, read from the environment
@@ -177,6 +180,35 @@ def login():
     raise SystemExit(f"Login failed after {LOGIN_MAX_ATTEMPTS} attempts: {last_error}")
 
 
+def get_my_booked_ids(token):
+    """
+    Return a set of BookingIDs the member is already booked into.
+
+    Used to skip alerting for classes you have already secured. Returns an
+    empty set on any error, so a hiccup here never blocks the normal watching.
+    """
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/json, text/plain, */*",
+        "Origin": "https://mylocker.virginactive.com.sg",
+        "Referer": "https://mylocker.virginactive.com.sg/",
+        "X-Mylocker-Language": "en-SG",
+    }
+    try:
+        r = requests.get(BOOKINGS_URL, headers=headers, timeout=REQUEST_TIMEOUT)
+        if r.status_code == 401:
+            raise PermissionError("token expired")
+        r.raise_for_status()
+        data = r.json()
+        bookings = data.get("MyBookings", {}).get("Bookings", []) or []
+        return {b.get("BookingID") for b in bookings if b.get("BookingID") is not None}
+    except PermissionError:
+        raise
+    except requests.RequestException as e:
+        log(f"Could not fetch your bookings ({e}). Will not skip any this cycle.")
+        return set()
+
+
 def query_classes(token, site, iso_date):
     """Fetch the class list for one club and one date."""
     headers = {
@@ -229,6 +261,16 @@ def main():
     log(f"This run lasts {RUN_DURATION_MINUTES} min, checking every {POLL_INTERVAL_SECONDS}s.")
 
     while datetime.now() < stop_at:
+        # Feature 1: fetch the classes you are already booked into, so we can
+        # skip alerting for those. Refreshed every cycle so it stays current
+        # (e.g. if you book one mid-run, it goes quiet on the next pass).
+        try:
+            booked_ids = get_my_booked_ids(token)
+        except PermissionError:
+            log("Token expired, logging in again...")
+            token = login()
+            booked_ids = get_my_booked_ids(token)
+
         for (site, iso_date), entries in groups.items():
             try:
                 classes = query_classes(token, site, iso_date)
@@ -246,6 +288,11 @@ def main():
 
                 if hit is None:
                     log(f"'{label}': not found in results (check match fields).")
+                    continue
+
+                # Feature 1: already booked? Stay quiet.
+                if hit.get("BookingID") in booked_ids:
+                    log(f"'{label}': already booked, skipping.")
                     continue
 
                 spaces = hit.get("SpacesRemaining", 0)
