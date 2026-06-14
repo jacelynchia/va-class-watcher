@@ -17,15 +17,7 @@
         "TimeString": "8:00pm",
         "Instructor": "Grace"
       }
-    },
-    {
-      "site": "SMO",
-      "match": {
-        "ClassName": "Cycle",
-        "TimeString": "10:00am"
-      },
-      "weekday": "Saturday"
     }
   ],
-  "tg_offset": 126857270
+  "tg_offset": 126857271
 }
