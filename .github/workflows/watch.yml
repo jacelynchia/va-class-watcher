@@ -1,19 +1,21 @@
 name: VA class watcher
 
-# Runs the watcher on a schedule so it works 24/7 without your laptop.
-# Each run polls for ~14 minutes, then this schedule starts the next one,
-# giving near-continuous coverage. You can also trigger a run by hand from
-# the Actions tab (the "Run workflow" button), which is great for testing.
+# Runs the watcher so it works 24/7 without your laptop.
+# Each run polls continuously for ~5.5 hours, then the schedule starts the next
+# one. Because each run is long, this gives near-continuous coverage even though
+# GitHub's scheduler is not punctual. A GitHub job can run up to 6 hours, so 5.5
+# leaves headroom for the handoff. You can also trigger a run by hand from the
+# Actions tab (the "Run workflow" button), which is handy for testing.
 
 on:
   schedule:
-    - cron: "*/15 * * * *"
+    - cron: "0 */6 * * *"
   workflow_dispatch:
 
 jobs:
   watch:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 350
     steps:
       - name: Check out the repo
         uses: actions/checkout@v4
