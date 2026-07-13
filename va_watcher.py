@@ -137,18 +137,26 @@ def log(msg):
 # ------------------------------------------------------------
 # Dates
 # ------------------------------------------------------------
-def next_weekday_iso(weekday_name):
+def next_weekday_iso(weekday_name, week=1):
+    """
+    ISO date of the given weekday. week=1 is the next occurrence (today counts),
+    week=2 is the one after that, etc. So day=Monday week=2 skips to the Monday
+    after next.
+    """
     key = weekday_name.strip().lower()
     if key not in WEEKDAYS:
         raise ValueError(f"Unknown weekday '{weekday_name}'.")
+    if week < 1:
+        week = 1
     today = datetime.now(SGT).date()
     days_ahead = (WEEKDAYS[key] - today.weekday()) % 7
+    days_ahead += (week - 1) * 7
     return (today + timedelta(days=days_ahead)).isoformat()
 
 
 def resolve_date(entry):
     if "weekday" in entry:
-        return next_weekday_iso(entry["weekday"])
+        return next_weekday_iso(entry["weekday"], entry.get("week", 1))
     if "date" in entry:
         return entry["date"]
     raise ValueError("Entry needs a 'weekday' or a 'date'.")
@@ -541,8 +549,10 @@ def check_availability(token, state, alerted):
 # ------------------------------------------------------------
 HELP_TEXT = (
     "<b>Virgin Active watcher commands</b>\n"
-    "/watch class=BODYPUMP day=Friday time=7:00pm instructor=Grace club=\"Marina One\"\n"
-    "   (club is optional, defaults to Paya Lebar; instructor is optional)\n"
+    "/watch class=BODYPUMP time=7:00pm day=Friday   (next Friday)\n"
+    "   ...or day=Friday week=2   (the Friday after next)\n"
+    "   ...or date=2026-07-20   (an exact date)\n"
+    "   optional: instructor=Grace  club=\"Marina One\"  (club defaults to Paya Lebar)\n"
     "/unwatch N    remove item N from the list\n"
     "/list    show what is being watched\n"
     "/clubs    list the clubs you can watch\n"
@@ -621,18 +631,31 @@ def cmd_watch(args_text, state):
     if instr:
         match["Instructor"] = instr
     entry = {"site": site, "match": match}
-    if day:
+    if one_date:
+        # Specific date wins if given. Validate the format.
+        try:
+            datetime.strptime(one_date, "%Y-%m-%d")
+        except ValueError:
+            send_telegram(f"'{one_date}' isn't a valid date. Use date=YYYY-MM-DD, e.g. date=2026-07-20.")
+            return
+        entry["date"] = one_date
+    else:
         if day.strip().lower() not in WEEKDAYS:
             send_telegram(f"'{day}' is not a weekday. Use Monday..Sunday.")
             return
         entry["weekday"] = day.strip().capitalize()
-    else:
-        entry["date"] = one_date
+        wk = kv.get("week")
+        if wk:
+            if not wk.isdigit() or int(wk) < 1:
+                send_telegram("week= must be a number 1 or higher (1 = next one, 2 = the one after).")
+                return
+            entry["week"] = int(wk)
 
     # Avoid duplicates (so reprocessing a command is harmless).
     for e in state["watchlist"]:
         if e.get("site") == entry["site"] and e.get("match") == entry["match"] and \
-           e.get("weekday") == entry.get("weekday") and e.get("date") == entry.get("date"):
+           e.get("weekday") == entry.get("weekday") and e.get("date") == entry.get("date") and \
+           e.get("week", 1) == entry.get("week", 1):
             send_telegram(f"Already watching: {entry_label(entry)}")
             return
 
