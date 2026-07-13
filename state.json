@@ -16,7 +16,8 @@
         "ClassName": "BODYPUMP",
         "TimeString": "8:00pm",
         "Instructor": "Grace"
-      }
+      },
+      "autobook": true
     },
     {
       "site": "SPL",
@@ -29,5 +30,5 @@
       "week": 2
     }
   ],
-  "tg_offset": 126857301
+  "tg_offset": 126857302
 }
