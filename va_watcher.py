@@ -606,6 +606,61 @@ def cmd_status(state):
     send_telegram(f"<b>Status</b>\n{running}\nWatching {n} class(es). Use /list to see them.")
 
 
+_CMD_TOKEN = {"token": None}
+
+def _command_token(state):
+    """A logged-in token for use inside command handlers (lazy, cached)."""
+    if _CMD_TOKEN["token"]:
+        return _CMD_TOKEN["token"]
+    try:
+        _CMD_TOKEN["token"] = login()
+    except SystemExit:
+        return None
+    except Exception:
+        return None
+    return _CMD_TOKEN["token"]
+
+
+def set_command_token(token):
+    """Let main() share its already-fresh token with command handlers."""
+    _CMD_TOKEN["token"] = token
+
+
+def _summarize_classes(classes, site):
+    """Short human list of classes found for a day, for correction hints."""
+    lines = []
+    for c in classes[:12]:
+        who = c.get("Instructor", "")
+        lines.append(f"- {c.get('TimeString','?')} {c.get('ClassName','?')}"
+                     + (f" ({who})" if who else ""))
+    return "\n".join(lines) if lines else "(none)"
+
+
+def validate_entry(entry, token):
+    """
+    Check whether an entry matches a real class on its resolved date.
+    Returns one of:
+      ("ok", hit)                 the class exists and matches
+      ("nomatch", classes)        that day has classes, but none match
+      ("unpublished", None)       that day has no schedule yet (can't verify)
+      ("error", None)             could not check (network/etc.)
+    """
+    try:
+        iso_date = resolve_date(entry)
+    except ValueError:
+        return "error", None
+    try:
+        classes = query_classes(token, entry["site"], iso_date)
+    except Exception:
+        return "error", None
+    if not classes:
+        return "unpublished", None
+    hit = next((c for c in classes if class_matches(c, entry["match"])), None)
+    if hit:
+        return "ok", hit
+    return "nomatch", classes
+
+
 def cmd_watch(args_text, state):
     kv = parse_kv(args_text)
     classname = kv.get("class") or kv.get("name")
@@ -659,6 +714,33 @@ def cmd_watch(args_text, state):
             send_telegram(f"Already watching: {entry_label(entry)}")
             return
 
+    # Validate against the real schedule before adding.
+    token = _command_token(state)
+    if token:
+        status, payload = validate_entry(entry, token)
+        if status == "nomatch":
+            iso_date = resolve_date(entry)
+            listing = _summarize_classes(payload, entry["site"])
+            send_telegram(
+                f"I couldn't find that class on {iso_date} at {club_name(entry['site'])}.\n"
+                f"Classes that day:\n{listing}\n\n"
+                f"Fix the time/instructor/club and try /watch again."
+            )
+            return
+        if status == "unpublished":
+            state["watchlist"].append(entry)
+            send_telegram(
+                f"Added: {entry_label(entry)}\n"
+                f"Note: that day's schedule isn't published yet, so I couldn't "
+                f"confirm the exact class. I'll match it once the schedule appears."
+            )
+            return
+        if status == "ok":
+            state["watchlist"].append(entry)
+            send_telegram(f"Now watching (confirmed): {entry_label(entry)}")
+            return
+        # status == error -> fall through and add without confirmation
+
     state["watchlist"].append(entry)
     send_telegram(f"Now watching: {entry_label(entry)}")
 
@@ -696,14 +778,34 @@ def cmd_autobook(args_text, state):
         send_telegram(f"There is no item {idx}. Use /list to see numbers.")
         return
     e = entries[idx - 1]
+
+    # Verify the class is real before arming (unless schedule not yet published).
+    token = _command_token(state)
+    if token:
+        status, payload = validate_entry(e, token)
+        if status == "nomatch":
+            iso_date = resolve_date(e)
+            listing = _summarize_classes(payload, e["site"])
+            send_telegram(
+                f"Not arming: I can't find {entry_label(e)} on {iso_date}.\n"
+                f"Classes that day:\n{listing}\n\n"
+                f"Fix the watch entry first, then /autobook again."
+            )
+            return
+
     e["autobook"] = True
     try:
         when = resolve_date(e)
         opent = compute_open_datetime(when).strftime("%a %d %b %H:%M")
+        note = ""
+        if token:
+            st2, _ = validate_entry(e, token)
+            if st2 == "unpublished":
+                note = "\n(Schedule for that day isn't out yet; I'll match it when it appears.)"
         send_telegram(
             f"Armed for auto-book: {entry_label(e)}\n"
             f"Booking opens {opent} SGT. I'll grab a seat the moment it opens, "
-            f"and keep trying for cancellations if I miss it. Disarms after booking."
+            f"and keep trying for cancellations if I miss it. Disarms after booking.{note}"
         )
     except Exception:
         send_telegram(f"Armed for auto-book: {entry_label(e)}")
@@ -767,6 +869,7 @@ def main():
 
     state = load_state()
     token = login()
+    set_command_token(token)
     alerted = set()
     last_avail = 0.0
     RUN_STOP_AT = datetime.now() + timedelta(minutes=RUN_DURATION_MINUTES)
@@ -818,6 +921,7 @@ def main():
             except PermissionError:
                 log("Token expired, logging in again...")
                 token = login()
+                set_command_token(token)
 
         # Pace the loop. Long-poll already paced us in relaxed mode; in hot mode
         # (or when Telegram is off) we sleep the short burst interval.
