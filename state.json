@@ -17,17 +17,7 @@
         "TimeString": "8:00pm",
         "Instructor": "Grace"
       }
-    },
-    {
-      "site": "SPL",
-      "match": {
-        "ClassName": "BODYPUMP",
-        "TimeString": "7:00pm",
-        "Instructor": "Grace"
-      },
-      "weekday": "Monday",
-      "week": 2
     }
   ],
-  "tg_offset": 126857295
+  "tg_offset": 126857296
 }
