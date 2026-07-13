@@ -56,6 +56,11 @@ RUN_DURATION_MINUTES = 230      # ~3h50m of polling per run (see workflow schedu
 REQUEST_TIMEOUT = 30            # seconds for normal HTTP calls.
 LOGIN_MAX_ATTEMPTS = 3          # login retries on a network blip.
 DEFAULT_SITE = "SPL"            # used when a /watch command omits site.
+BURST_LEAD_SECONDS = 45        # start hammering this many secs before a known open-time.
+BURST_POLL_SECONDS = 1.5       # poll interval while in burst/scramble mode.
+BOOK_OPEN_DAYS_BEFORE = 7      # booking opens this many days before the class...
+BOOK_OPEN_HOUR = 21            # ...at this hour (SGT), i.e. 9pm.
+MAX_SEAT_ATTEMPTS = 25         # how many seats to try before giving up one pass.
 
 # All Virgin Active Singapore clubs, by SiteID, with friendly names and aliases.
 # Captured from the getoptions response. Add new clubs here if they open.
@@ -101,6 +106,8 @@ def club_name(site):
 TOKEN_URL = "https://hal.virginactive.com.sg/token"
 API_URL = "https://hal.virginactive.com.sg/api/classes/bookableclassquery"
 BOOKINGS_URL = "https://hal.virginactive.com.sg/api/bookings/getbookings"
+CLASSOPTIONS_URL = "https://hal.virginactive.com.sg/api/classes/getclassoptions"
+MAKEBOOKING_URL = "https://hal.virginactive.com.sg/api/bookings/makeclassbooking"
 
 # ============================================================
 # Secrets / environment
@@ -177,12 +184,14 @@ def send_telegram(text):
         log(f"Failed to send Telegram message: {e}")
 
 
-def tg_get_updates(offset):
-    """Long-poll for new messages. Returns up to ~50s blocking, or sooner."""
+def tg_get_updates(offset, long_poll=True):
+    """Fetch new messages. long_poll blocks up to ~50s; otherwise returns fast."""
     if not TELEGRAM_BOT_TOKEN:
         return []
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
-    r = requests.get(url, params={"offset": offset, "timeout": 50}, timeout=70)
+    timeout = 50 if long_poll else 0
+    r = requests.get(url, params={"offset": offset, "timeout": timeout},
+                     timeout=(70 if long_poll else REQUEST_TIMEOUT))
     r.raise_for_status()
     return r.json().get("result", [])
 
@@ -331,9 +340,127 @@ def class_matches(cls, criteria):
 # ------------------------------------------------------------
 # Availability check
 # ------------------------------------------------------------
-def check_availability(token, entries, alerted):
+def compute_open_datetime(iso_date):
+    """Booking opens BOOK_OPEN_DAYS_BEFORE days before the class, at BOOK_OPEN_HOUR SGT."""
+    class_day = datetime.strptime(iso_date, "%Y-%m-%d").date()
+    open_day = class_day - timedelta(days=BOOK_OPEN_DAYS_BEFORE)
+    return datetime(open_day.year, open_day.month, open_day.day,
+                    BOOK_OPEN_HOUR, 0, 0, tzinfo=SGT)
+
+
+def is_hot_window(entries):
+    """
+    True if any armed (autobook) entry is in an aggressive-polling window:
+    either near its known booking-open time, or already past it (scramble for
+    cancellations). Non-armed entries never make it hot.
+    """
+    now = datetime.now(SGT)
+    for e in entries:
+        if not e.get("autobook"):
+            continue
+        try:
+            open_dt = compute_open_datetime(resolve_date(e))
+        except Exception:
+            return True  # armed but can't compute time -> be safe, hammer
+        # Hot from BURST_LEAD_SECONDS before the open time onward (scramble after).
+        if now >= open_dt - timedelta(seconds=BURST_LEAD_SECONDS):
+            return True
+    return False
+
+
+def get_free_seats(token, booking_id, plus2id):
+    """
+    Return a list of available SeatNumbers for a class, best first.
+    A seat is free when RoomItemType == 1. Returns [] on any problem.
+    """
+    headers = dict(_va_headers(token))
+    headers["Content-Type"] = "application/json;charset=UTF-8"
+    payload = {"BookingID": booking_id, "Plus2DescriptionProductID": plus2id}
+    r = requests.post(CLASSOPTIONS_URL, json=payload, headers=headers, timeout=REQUEST_TIMEOUT)
+    if r.status_code == 401:
+        raise PermissionError("token expired")
+    r.raise_for_status()
+    data = r.json()
+    free = []
+    for row in data.get("RoomLayout", []) or []:
+        for cell in row:
+            if cell.get("RoomItemType") == 1 and cell.get("SeatNumber", 0) > 0:
+                free.append(cell["SeatNumber"])
+    return free
+
+
+def make_booking(token, booking_id, seat_number):
+    """
+    Attempt one booking of a specific seat. Returns (ok, message).
+    ok is True only when the API confirms Success == true.
+    """
+    headers = dict(_va_headers(token))
+    headers["Content-Type"] = "application/json;charset=UTF-8"
+    payload = {
+        "MemberID": int(VA_USERNAME),
+        "BookingID": booking_id,
+        "SeatNumber": seat_number,
+        "Message": "",
+    }
+    r = requests.post(MAKEBOOKING_URL, json=payload, headers=headers, timeout=REQUEST_TIMEOUT)
+    if r.status_code == 401:
+        raise PermissionError("token expired")
+    r.raise_for_status()
+    data = r.json()
+    if data.get("Success") is True:
+        return True, "booked"
+    return False, (data.get("ErrorMessage") or "unknown error")
+
+
+def try_autobook(token, hit, label):
+    """
+    Try hard to book the matched class. Reads free seats, books the first,
+    retries through other seats if one is snatched. Returns (booked, seat_or_msg).
+    """
+    booking_id = hit.get("BookingID")
+    plus2id = hit.get("Plus2Identifier")
+    if not booking_id or not plus2id:
+        return False, "missing booking id / plus2 id"
+
+    attempts = 0
+    while attempts < MAX_SEAT_ATTEMPTS:
+        try:
+            free = get_free_seats(token, booking_id, plus2id)
+        except PermissionError:
+            raise
+        except requests.RequestException as e:
+            return False, f"seat lookup failed: {e}"
+
+        if not free:
+            return False, "no free seats"
+
+        seat = free[0]
+        attempts += 1
+        try:
+            ok, msg = make_booking(token, booking_id, seat)
+        except PermissionError:
+            raise
+        except requests.RequestException as e:
+            return False, f"booking call failed: {e}"
+
+        if ok:
+            return True, seat
+        # seat was probably taken between read and book -> loop and try another
+        log(f"'{label}': seat {seat} failed ({msg}), retrying...")
+
+    return False, "exhausted seat attempts"
+
+
+def check_availability(token, state, alerted):
+    """
+    One availability pass over all watched entries. Armed entries (autobook)
+    are booked automatically; others just alert. Returns True if any armed
+    entry was booked (so the caller can persist the disarmed state).
+    """
+    entries = state["watchlist"]
     if not entries:
-        return
+        return False
+
     groups = {}
     for e in entries:
         try:
@@ -344,6 +471,7 @@ def check_availability(token, entries, alerted):
         groups.setdefault((e["site"], d), []).append(e)
 
     booked_ids = get_my_booked_ids(token)  # may raise PermissionError
+    changed = False
 
     for (site, iso_date), es in groups.items():
         try:
@@ -359,8 +487,38 @@ def check_availability(token, entries, alerted):
                 continue
             if hit.get("BookingID") in booked_ids:
                 log(f"'{label}': already booked, skipping.")
+                if e.get("autobook"):
+                    # Already in it, so the arm is done.
+                    e.pop("autobook", None)
+                    changed = True
                 continue
+
             spaces = hit.get("SpacesRemaining", 0)
+
+            # ---- ARMED: auto-book ----
+            if e.get("autobook"):
+                if spaces > 0:
+                    log(f"'{label}': ARMED and open ({spaces}). Attempting to book...")
+                    try:
+                        ok, info = try_autobook(token, hit, label)
+                    except PermissionError:
+                        raise
+                    if ok:
+                        log(f"'{label}': BOOKED, seat {info}. Disarming.")
+                        send_telegram(
+                            f"<b>Booked!</b>\n{label}\nSeat {info}. "
+                            f"Auto-book done, this class is now disarmed."
+                        )
+                        e.pop("autobook", None)
+                        changed = True
+                    else:
+                        log(f"'{label}': book attempt failed ({info}).")
+                        # stay armed, try again next cycle
+                else:
+                    log(f"'{label}': armed, still full.")
+                continue
+
+            # ---- NOT armed: alert only ----
             if spaces > 0:
                 if label not in alerted:
                     log(f"'{label}': SPOT OPEN ({spaces} left). Alerting!")
@@ -375,6 +533,8 @@ def check_availability(token, entries, alerted):
             else:
                 log(f"'{label}': full.")
 
+    return changed
+
 
 # ------------------------------------------------------------
 # Telegram commands
@@ -386,6 +546,8 @@ HELP_TEXT = (
     "/unwatch N    remove item N from the list\n"
     "/list    show what is being watched\n"
     "/clubs    list the clubs you can watch\n"
+    "/autobook N    auto-book item N the moment booking opens (spends a credit!)\n"
+    "/cancelbook N    turn off auto-book for item N (keep watching)\n"
     "/status    is it running, what is watched\n"
     "/help    this message\n\n"
     "Tip: use single words for values, e.g. class=BODYPUMP, instructor=Grace, "
@@ -413,7 +575,14 @@ def cmd_list(state):
             when = resolve_date(e)
         except ValueError:
             when = "?"
-        lines.append(f"{i}. {entry_label(e)}  (next: {when})")
+        tag = ""
+        if e.get("autobook"):
+            try:
+                opent = compute_open_datetime(when).strftime("%a %d %b %H:%M")
+                tag = f"  [AUTO-BOOK, opens {opent}]"
+            except Exception:
+                tag = "  [AUTO-BOOK]"
+        lines.append(f"{i}. {entry_label(e)}  (next: {when}){tag}")
     send_telegram("\n".join(lines))
 
 
@@ -493,6 +662,47 @@ def cmd_clubs():
     send_telegram("\n".join(lines))
 
 
+def cmd_autobook(args_text, state):
+    entries = state["watchlist"]
+    arg = args_text.strip()
+    if not arg.isdigit():
+        send_telegram("Tell me which item to auto-book, e.g. /autobook 2. Use /list for numbers.")
+        return
+    idx = int(arg)
+    if idx < 1 or idx > len(entries):
+        send_telegram(f"There is no item {idx}. Use /list to see numbers.")
+        return
+    e = entries[idx - 1]
+    e["autobook"] = True
+    try:
+        when = resolve_date(e)
+        opent = compute_open_datetime(when).strftime("%a %d %b %H:%M")
+        send_telegram(
+            f"Armed for auto-book: {entry_label(e)}\n"
+            f"Booking opens {opent} SGT. I'll grab a seat the moment it opens, "
+            f"and keep trying for cancellations if I miss it. Disarms after booking."
+        )
+    except Exception:
+        send_telegram(f"Armed for auto-book: {entry_label(e)}")
+
+
+def cmd_cancelbook(args_text, state):
+    entries = state["watchlist"]
+    arg = args_text.strip()
+    if not arg.isdigit():
+        send_telegram("Tell me which item to disarm, e.g. /cancelbook 2.")
+        return
+    idx = int(arg)
+    if idx < 1 or idx > len(entries):
+        send_telegram(f"There is no item {idx}. Use /list to see numbers.")
+        return
+    e = entries[idx - 1]
+    if e.pop("autobook", None):
+        send_telegram(f"Auto-book turned off for: {entry_label(e)} (still watching).")
+    else:
+        send_telegram(f"That one wasn't armed anyway: {entry_label(e)}")
+
+
 def handle_command(text, state):
     parts = text.strip().split(maxsplit=1)
     cmd = parts[0].lower().lstrip("/")
@@ -512,6 +722,10 @@ def handle_command(text, state):
         cmd_unwatch(args, state)
     elif cmd == "clubs":
         cmd_clubs()
+    elif cmd == "autobook":
+        cmd_autobook(args, state)
+    elif cmd in ("cancelbook", "manual"):
+        cmd_cancelbook(args, state)
     else:
         send_telegram("Unknown command. Send /help to see what I can do.")
 
@@ -543,13 +757,17 @@ def main():
             log(f"  - {entry_label(e)} (bad date)")
 
     while datetime.now() < RUN_STOP_AT:
-        # 1. Commands (long-poll, so this also paces the loop)
+        hot = is_hot_window(state["watchlist"])
+        avail_interval = BURST_POLL_SECONDS if hot else POLL_INTERVAL_SECONDS
+
+        # 1. Commands. In relaxed mode we long-poll (which also paces the loop).
+        #    In hot mode we do a quick non-blocking check so we can hammer bookings.
         try:
-            updates = tg_get_updates(state["tg_offset"])
-            changed = False
+            updates = tg_get_updates(state["tg_offset"], long_poll=not hot)
+            cmd_changed = False
             for u in updates:
                 state["tg_offset"] = u["update_id"] + 1
-                changed = True
+                cmd_changed = True
                 msg = u.get("message") or u.get("edited_message") or {}
                 chat_id = str((msg.get("chat") or {}).get("id", ""))
                 if chat_id != str(TELEGRAM_CHAT_ID):
@@ -561,24 +779,27 @@ def main():
                     except Exception as ce:
                         log(f"Command error: {ce}")
                         send_telegram("Sorry, that command hit an error. Try /help.")
-            if changed:
+            if cmd_changed:
                 save_state(state)
         except requests.RequestException as e:
             log(f"Telegram poll issue: {e}")
-            time.sleep(5)
+            time.sleep(2)
 
-        # 2. Availability check, at most every POLL_INTERVAL_SECONDS
-        if time.time() - last_avail >= POLL_INTERVAL_SECONDS:
+        # 2. Availability + auto-book, gated by the current interval.
+        if time.time() - last_avail >= avail_interval:
             last_avail = time.time()
             try:
-                check_availability(token, state["watchlist"], alerted)
+                booked_changed = check_availability(token, state, alerted)
+                if booked_changed:
+                    save_state(state)  # persist disarm after a successful booking
             except PermissionError:
                 log("Token expired, logging in again...")
                 token = login()
 
-        # If Telegram is not configured there is no long-poll to pace us.
-        if not TELEGRAM_BOT_TOKEN:
-            time.sleep(POLL_INTERVAL_SECONDS)
+        # Pace the loop. Long-poll already paced us in relaxed mode; in hot mode
+        # (or when Telegram is off) we sleep the short burst interval.
+        if hot or not TELEGRAM_BOT_TOKEN:
+            time.sleep(BURST_POLL_SECONDS if hot else POLL_INTERVAL_SECONDS)
 
     log("Run finished. The schedule will start the next one shortly.")
 
