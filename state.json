@@ -29,17 +29,7 @@
       "weekday": "Monday",
       "week": 2,
       "autobook": true
-    },
-    {
-      "site": "SPL",
-      "match": {
-        "ClassName": "BODYPUMP",
-        "TimeString": "8:00pm",
-        "Instructor": "Grace"
-      },
-      "weekday": "Wednesday",
-      "week": 2
     }
   ],
-  "tg_offset": 126857308
+  "tg_offset": 126857309
 }
