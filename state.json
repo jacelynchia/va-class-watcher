@@ -38,8 +38,7 @@
         "Instructor": "Grace"
       },
       "weekday": "Wednesday",
-      "week": 2,
-      "autobook": true
+      "week": 2
     }
   ],
   "tg_offset": 126857307
