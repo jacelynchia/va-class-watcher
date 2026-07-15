@@ -17,8 +17,7 @@
         "ClassName": "BODYPUMP",
         "TimeString": "8:00pm",
         "Instructor": "Grace"
-      },
-      "autobook": true
+      }
     },
     {
       "site": "SPL",
