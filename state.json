@@ -13,16 +13,6 @@
       "site": "SPL",
       "match": {
         "ClassName": "BODYPUMP",
-        "TimeString": "8:15pm",
-        "Instructor": "Grace"
-      },
-      "weekday": "Monday",
-      "week": 2
-    },
-    {
-      "site": "SPL",
-      "match": {
-        "ClassName": "BODYPUMP",
         "TimeString": "8:00pm"
       },
       "weekday": "Wednesday"
@@ -36,5 +26,5 @@
       "date": "2026-07-29"
     }
   ],
-  "tg_offset": 126857328
+  "tg_offset": 126857329
 }
