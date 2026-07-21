@@ -6,8 +6,9 @@
         "ClassName": "BODYPUMP",
         "TimeString": "8:00pm"
       },
-      "date": "2026-07-29"
+      "date": "2026-07-29",
+      "autobook": true
     }
   ],
-  "tg_offset": 126857335
+  "tg_offset": 126857336
 }
