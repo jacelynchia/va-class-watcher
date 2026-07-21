@@ -2,15 +2,6 @@
   "watchlist": [
     {
       "site": "SPL",
-      "weekday": "Monday",
-      "match": {
-        "ClassName": "BODYPUMP",
-        "TimeString": "8:15pm",
-        "Instructor": "Grace"
-      }
-    },
-    {
-      "site": "SPL",
       "weekday": "Wednesday",
       "match": {
         "ClassName": "BODYPUMP",
@@ -45,5 +36,5 @@
       "date": "2026-07-29"
     }
   ],
-  "tg_offset": 126857327
+  "tg_offset": 126857328
 }
