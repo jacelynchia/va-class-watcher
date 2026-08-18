@@ -7,7 +7,15 @@
         "TimeString": "8:15pm"
       },
       "date": "2026-08-17"
+    },
+    {
+      "site": "SPL",
+      "match": {
+        "ClassName": "BODYPUMP",
+        "TimeString": "8:00pm"
+      },
+      "date": "2026-08-26"
     }
   ],
-  "tg_offset": 126857369
+  "tg_offset": 126857370
 }
