@@ -1,4 +1,13 @@
 {
-  "watchlist": [],
-  "tg_offset": 126857375
+  "watchlist": [
+    {
+      "site": "SPL",
+      "match": {
+        "ClassName": "BODYPUMP",
+        "TimeString": "8:15pm"
+      },
+      "date": "2026-08-31"
+    }
+  ],
+  "tg_offset": 126857376
 }
