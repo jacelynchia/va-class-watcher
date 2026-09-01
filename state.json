@@ -8,7 +8,15 @@
       },
       "date": "2026-09-07",
       "autobook": true
+    },
+    {
+      "site": "SPL",
+      "match": {
+        "ClassName": "BODYPUMP",
+        "TimeString": "8:00pm"
+      },
+      "date": "2026-09-09"
     }
   ],
-  "tg_offset": 126857391
+  "tg_offset": 126857393
 }
